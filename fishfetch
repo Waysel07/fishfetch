@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""fastfetch with an animated fish as the logo.
+
+Runs fastfetch with a blank logo of the same size, then animates over that
+space. Any key stops it early (and still reaches your shell). The default is
+the ASCII fish from ascii.live, which works in any terminal. --gif plays any
+GIF as an image instead: sixel for Konsole and most terminals, kitty's
+graphics protocol in kitty.
+
+  fishfetch                  play 3 loops (any key stops)
+  fishfetch -l 0             loop until a key is pressed
+  fishfetch --gif fish.gif   play a GIF as the logo
+  fishfetch -- --structure Title:OS:Kernel   extra args go to fastfetch
+"""
+import argparse
+import base64
+import fcntl
+import hashlib
+import os
+import select
+import struct
+import subprocess
+import sys
+import termios
+import time
+import tty
+from pathlib import Path
+
+__version__ = "1.0.0"
+
+HERE = Path(__file__).resolve().parent
+DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "fishfetch"
+FRAME_DIRS = [Path(p) for p in [os.environ.get("FISHFETCH_FRAMES")] if p] + [
+    HERE / "frames", HERE.parent / "share/fishfetch/frames", DATA_HOME / "fishfetch/frames",
+    Path("/usr/local/share/fishfetch/frames"), Path("/usr/share/fishfetch/frames")]
+ASCII_DELAY = 0.08  # ascii.live's own frame rate
+DEFAULT_COLOR = "64d2ff"  # macOS system cyan
+INFO_COLS = 52  # rough width of fastfetch's info column
+GIF_COLS = 34  # GIF logo width in terminal columns
+PAD_TOP, PAD_LEFT, PAD_RIGHT = 2, 2, 4
+
+
+def cell_size() -> tuple[int, int]:
+    """Pixel size of one terminal cell; falls back to a typical 9x19."""
+    try:
+        rows, cols, xpix, ypix = struct.unpack("HHHH", fcntl.ioctl(
+            sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8))
+        if xpix and ypix and cols and rows:
+            return xpix // cols, ypix // rows
+    except OSError:
+        pass
+    return 9, 19
+
+
+def kitty_frame(png: bytes, rows: int) -> str:
+    data = base64.b64encode(png).decode()
+    chunks = [data[i:i + 4096] for i in range(0, len(data), 4096)]
+    out = []
+    for i, chunk in enumerate(chunks):
+        more = 1 if i < len(chunks) - 1 else 0
+        head = f"a=T,f=100,c={GIF_COLS},r={rows},C=1,q=2,m={more}" if i == 0 else f"m={more}"
+        out.append(f"\033_G{head};{chunk}\033\\")
+    return "".join(out)
+
+
+def gif_frames(gif: Path, kitty: bool) -> tuple[list[str], int, int, float]:
+    """Split a GIF into frames (cached) and encode them for the terminal."""
+    probe = subprocess.run(["magick", "identify", "-format", "%w %h %T\n", str(gif)],
+                           capture_output=True, text=True, check=True).stdout.split("\n")[0].split()
+    gif_w, gif_h, delay = int(probe[0]), int(probe[1]), (int(probe[2]) or 9) / 100
+    cw, ch = cell_size()
+    px_w = GIF_COLS * cw
+    px_h = round(px_w * gif_h / gif_w)
+    rows = -(-px_h // ch)  # ceil
+
+    key = hashlib.sha1(gif.read_bytes()).hexdigest()[:12]
+    pngs = CACHE / key / "png"
+    if not pngs.is_dir():
+        tmp = pngs.with_suffix(".tmp")
+        tmp.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["magick", str(gif), "-coalesce", str(tmp / "frame-%03d.png")], check=True)
+        tmp.rename(pngs)
+    files = sorted(pngs.glob("frame-*.png"))
+    if kitty:
+        return [kitty_frame(f.read_bytes(), rows) for f in files], GIF_COLS, rows, delay
+
+    sixels = CACHE / key / f"sixel-{px_w}x{px_h}"
+    if not sixels.is_dir():
+        tmp = sixels.with_suffix(".tmp")
+        tmp.mkdir(parents=True, exist_ok=True)
+        for f in files:
+            subprocess.run(["magick", str(f), "-resize", f"{px_w}x{px_h}!", f"sixel:{tmp / (f.stem + '.six')}"],
+                           check=True)
+        tmp.rename(sixels)
+    return [(sixels / (f.stem + ".six")).read_text() for f in files], GIF_COLS, rows, delay
+
+
+def ascii_dir() -> Path | None:
+    return next((d for d in FRAME_DIRS if any(d.glob("frame-*.txt"))), None)
+
+
+def ascii_frames(color: str, skip: int = 0) -> tuple[list[str], int, int]:
+    """The ascii.live fish, each frame drawn line by line in place.
+    `skip` leaves out top lines that have scrolled off the screen."""
+    texts = [f.read_text().rstrip("\n").split("\n") for f in
+             sorted(ascii_dir().glob("frame-*.txt"), key=lambda p: int(p.stem.split("-")[1]))]
+    width = max(len(line) for t in texts for line in t)
+    rows = max(map(len, texts))
+    r, g, b = (int(color[i:i + 2], 16) for i in (0, 2, 4))
+    next_line = f"\033[1B\r\033[{PAD_LEFT}C"
+    frames = [f"\033[38;2;{r};{g};{b}m" + next_line.join(
+                  line.ljust(width) for line in (t + [""] * (rows - len(t)))[skip:]) + "\033[0m"
+              for t in texts]
+    return frames, width, rows
+
+
+def hex_color(value: str) -> str:
+    value = value.lstrip("#")
+    if len(value) != 6 or any(c not in "0123456789abcdefABCDEF" for c in value):
+        raise argparse.ArgumentTypeError("expected a hex colour like 64d2ff")
+    return value
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="fishfetch", description="fastfetch with an animated fish logo",
+                                 epilog="Unknown options are passed through to fastfetch.")
+    ap.add_argument("-l", "--loops", type=int, default=3, help="loops to play, 0 = until a key (default 3)")
+    ap.add_argument("-g", "--gif", type=Path, metavar="FILE", help="play this GIF as an image logo")
+    ap.add_argument("-c", "--color", type=hex_color, default=DEFAULT_COLOR,
+                    help=f"ASCII fish colour as hex (default {DEFAULT_COLOR})")
+    ap.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
+    args, rest = ap.parse_known_args()
+    if rest[:1] == ["--"]:
+        rest = rest[1:]
+
+    if not sys.stdout.isatty() or (not args.gif and ascii_dir() is None):
+        return subprocess.call(["fastfetch", *rest])
+
+    clear_kitty = False
+    if args.gif:
+        kitty = "KITTY_WINDOW_ID" in os.environ or os.environ.get("TERM") == "xterm-kitty"
+        clear_kitty = kitty
+        frames, width, rows, delay = gif_frames(args.gif.expanduser().resolve(), kitty)
+    else:
+        frames, width, rows = ascii_frames(args.color)
+        delay = ASCII_DELAY
+
+    blank = "\n".join([" " * width] * rows)
+    # The ASCII fish is wide; on narrow terminals put it above the info instead.
+    term_cols = os.get_terminal_size().columns
+    position = ["--logo-position", "top"] if width + PAD_LEFT + PAD_RIGHT + INFO_COLS > term_cols else []
+    out = subprocess.run(["fastfetch", "--pipe", "false", "--logo-type", "data", "--logo", blank,
+                          "--logo-padding-top", str(PAD_TOP), "--logo-padding-left", str(PAD_LEFT),
+                          "--logo-padding-right", str(PAD_RIGHT), *position, *rest],
+                         capture_output=True, text=True).stdout.rstrip("\n")
+    lines = out.count("\n") + 1
+    sys.stdout.write(out + "\n")
+
+    # Cursor is now on the line below the output; the logo starts PAD_TOP lines
+    # in. If the output was taller than the window, its top has scrolled away.
+    up = lines - PAD_TOP
+    scrolled = max(0, up - (os.get_terminal_size().lines - 1))
+    if scrolled:
+        if args.gif or scrolled >= rows:
+            return 0  # an image can't be drawn partly off-screen
+        frames = ascii_frames(args.color, scrolled)[0]
+        up -= scrolled
+    goto_logo = f"\0337\033[{up}A\r\033[{PAD_LEFT}C" if up > 0 else "\0337\r"
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd) if sys.stdin.isatty() else None
+    try:
+        if old:
+            tty.setcbreak(fd)
+        sys.stdout.write("\033[?25l")  # hide cursor while animating
+        total = len(frames) * args.loops if args.loops > 0 else None
+        i = 0
+        clear = "\033_Ga=d,d=a,q=2\033\\" if clear_kitty else ""
+        while total is None or i < total:
+            sys.stdout.write(goto_logo + clear + frames[i % len(frames)] + "\0338")
+            sys.stdout.flush()
+            if old and select.select([sys.stdin], [], [], delay)[0]:
+                break  # leave the key unread so the shell still gets it
+            elif not old:
+                time.sleep(delay)
+            i += 1
+        # Settle on the first frame so the logo doesn't stop mid-turn.
+        sys.stdout.write(goto_logo + clear + frames[0] + "\0338")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
+        if old:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
