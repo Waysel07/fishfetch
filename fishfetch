@@ -15,16 +15,21 @@ graphics protocol in kitty.
 """
 import argparse
 import base64
-import fcntl
 import hashlib
 import os
 import select
 import struct
 import subprocess
 import sys
-import termios
 import time
-import tty
+try:
+    import fcntl
+    import termios
+    import tty
+    WINDOWS = False
+except ImportError:  # Windows
+    import msvcrt
+    WINDOWS = True
 from pathlib import Path
 
 __version__ = "1.0.0"
@@ -45,6 +50,8 @@ PAD_TOP, PAD_LEFT, PAD_RIGHT = 2, 2, 4
 def cell_size() -> tuple[int, int]:
     """Pixel size of one terminal cell; falls back to a typical 9x19."""
     try:
+        if WINDOWS:
+            raise OSError
         rows, cols, xpix, ypix = struct.unpack("HHHH", fcntl.ioctl(
             sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8))
         if xpix and ypix and cols and rows:
@@ -135,6 +142,9 @@ def main() -> int:
     if rest[:1] == ["--"]:
         rest = rest[1:]
 
+    if WINDOWS:
+        os.system("")  # enable ANSI/VT escape processing in the console
+        sys.stdout.reconfigure(encoding="utf-8")
     if not sys.stdout.isatty() or (not args.gif and ascii_dir() is None):
         return subprocess.call(["fastfetch", *rest])
 
@@ -154,7 +164,11 @@ def main() -> int:
     out = subprocess.run(["fastfetch", "--pipe", "false", "--logo-type", "data", "--logo", blank,
                           "--logo-padding-top", str(PAD_TOP), "--logo-padding-left", str(PAD_LEFT),
                           "--logo-padding-right", str(PAD_RIGHT), *position, *rest],
-                         capture_output=True, text=True).stdout.rstrip("\n")
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if out.returncode != 0 or not out.stdout.strip():
+        sys.stderr.write(out.stderr)  # e.g. "unknown option" -- don't draw a fish over nothing
+        return out.returncode or 1
+    out = out.stdout.rstrip("\n")
     lines = out.count("\n") + 1
     sys.stdout.write(out + "\n")
 
@@ -169,7 +183,7 @@ def main() -> int:
         up -= scrolled
     goto_logo = f"\0337\033[{up}A\r\033[{PAD_LEFT}C" if up > 0 else "\0337\r"
     fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd) if sys.stdin.isatty() else None
+    old = termios.tcgetattr(fd) if not WINDOWS and sys.stdin.isatty() else None
     try:
         if old:
             tty.setcbreak(fd)
@@ -182,6 +196,12 @@ def main() -> int:
             sys.stdout.flush()
             if old and select.select([sys.stdin], [], [], delay)[0]:
                 break  # leave the key unread so the shell still gets it
+            elif WINDOWS:
+                end = time.monotonic() + delay
+                while time.monotonic() < end and not msvcrt.kbhit():
+                    time.sleep(0.01)
+                if msvcrt.kbhit():
+                    break
             elif not old:
                 time.sleep(delay)
             i += 1

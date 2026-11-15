@@ -29,6 +29,21 @@ Or run it straight from the clone: `./fishfetch`.
 
 Uninstall with `./install.sh --uninstall`.
 
+### Windows
+
+Works in Windows Terminal (the legacy console may garble the animation).
+`--gif` is untested on Windows.
+
+```powershell
+winget install Fastfetch-cli.Fastfetch
+git clone https://github.com/Waysel07/fishfetch
+cd fishfetch
+.\install.ps1                    # ~\.local\bin, adds it to your PATH
+```
+
+Uninstall with `.\install.ps1 -Uninstall`. As a greeting, add `fishfetch -l 1`
+to your PowerShell profile (`notepad $PROFILE`).
+
 ## Usage
 
 ```sh
